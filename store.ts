@@ -50,6 +50,11 @@ export interface IssueRecord {
   comments: CommentRecord[];
   createdSeq: number;
   updatedSeq: number;
+  /** Cached serialization of issueJson for this record, or null when the
+   * record changed since it was built. Every mutation site clears it
+   * (addComment, REST PATCH, GraphQL closeIssue); labels are immutable
+   * and the viewer is fixed, so nothing else can stale it. */
+  jsonCache: Buffer | null;
 }
 
 export interface PullRecord {
@@ -97,6 +102,13 @@ export class RepoState {
   readonly commitCache = new Map<string, ParsedCommit>();
   readonly treeCache = new Map<string, TreeEntry[]>();
   readonly flatCache = new Map<string, Map<string, FlatEntry>>();
+
+  // Whole-response cache for git smart HTTP (advertisements, ls-refs,
+  // fetch replies), keyed by gitproto.ts on the request plus a fingerprint
+  // of the refs and the object count. Objects only ever grow and refs are
+  // in the key, so a hit is always the current answer. Bounded by
+  // gitproto.ts; dropped with the repository.
+  readonly gitResponseCache = new Map<string, Buffer>();
 
   constructor(id: number, name: string, description: string, isPrivate: boolean, createdSeq: number) {
     this.id = id;
@@ -267,6 +279,7 @@ export class Store {
       comments: [],
       createdSeq: seq,
       updatedSeq: seq,
+      jsonCache: null,
     };
     this.nextRecordId += 1;
     repo.nextNumber += 1;
@@ -279,6 +292,7 @@ export class Store {
     this.nextCommentId += 1;
     issue.comments.push(comment);
     issue.updatedSeq = repo.nextSeq();
+    issue.jsonCache = null;
     return comment;
   }
 
@@ -703,6 +717,18 @@ export function issueJson(store: Store, repo: RepoState, issue: IssueRecord): Re
     updated_at: FIXED_TIME,
     closed_at: issue.state === 'closed' ? FIXED_TIME : null,
   };
+}
+
+/** The exact bytes issueJson serializes to, cached on the record. The
+ * read workload fetches one issue thousands of times unchanged, so the
+ * second and later reads send these bytes without rebuilding the object
+ * or stringifying it again. Mutation sites clear the cache. */
+export function issueJsonBuffer(store: Store, repo: RepoState, issue: IssueRecord): Buffer {
+  const cached = issue.jsonCache;
+  if (cached !== null) return cached;
+  const built = Buffer.from(JSON.stringify(issueJson(store, repo, issue)), 'utf8');
+  issue.jsonCache = built;
+  return built;
 }
 
 export function commentJson(store: Store, comment: CommentRecord): Record<string, unknown> {

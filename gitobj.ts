@@ -25,7 +25,8 @@ export function isOid(value: string): boolean {
 
 export function hashObject(type: GitObjectType, data: Uint8Array): string {
   const hash = createHash('sha1');
-  hash.update(Buffer.from(`${type} ${data.length}\0`, 'utf8'));
+  // The header is plain ASCII: feed it as a string, no Buffer allocation.
+  hash.update(`${type} ${data.length}\0`, 'utf8');
   hash.update(data);
   return hash.digest('hex');
 }
@@ -140,9 +141,10 @@ export const PKT_LINE_MAX = 65520;
 
 export function pktLine(payload: string | Buffer): Buffer {
   const data = typeof payload === 'string' ? Buffer.from(payload, 'utf8') : payload;
-  const header = Buffer.allocUnsafe(4);
-  header.write((data.length + 4).toString(16).padStart(4, '0'), 0, 4, 'ascii');
-  return Buffer.concat([header, data]);
+  const out = Buffer.allocUnsafe(4 + data.length);
+  out.write((data.length + 4).toString(16).padStart(4, '0'), 0, 4, 'ascii');
+  data.copy(out, 4);
+  return out;
 }
 
 export function pktFlush(): Buffer {
@@ -366,6 +368,7 @@ export function readPack(pack: Buffer, resolveBase?: (oid: string) => GitObject 
 
   const raw: RawPackEntry[] = [];
   const byOffset = new Map<number, RawPackEntry>();
+  const packBody = pack.subarray(0, trailerStart);
   let offset = 12;
   for (let index = 0; index < declaredCount; index += 1) {
     const entryOffset = offset;
@@ -385,7 +388,7 @@ export function readPack(pack: Buffer, resolveBase?: (oid: string) => GitObject 
     } else if (!CODE_TYPE[typeCode]) {
       throw new Error(`pack entry has unknown type code ${typeCode}`);
     }
-    const inflated = inflateAt(pack.subarray(0, trailerStart), offset);
+    const inflated = inflateAt(packBody, offset);
     if (inflated.data.length !== header.size) throw new Error('pack entry size mismatch');
     entry.data = inflated.data;
     offset = inflated.next;
@@ -395,6 +398,24 @@ export function readPack(pack: Buffer, resolveBase?: (oid: string) => GitObject 
   if (offset !== trailerStart) throw new Error('pack has stray bytes before its trailer');
 
   const objects = new Map<string, GitObject>();
+  // Fast path: a pack with no delta entries resolves inline, one hash per
+  // object, without the delta machinery below. The benchmark's pushes and
+  // the suite's packs are delta-free; delta packs take the general path.
+  let hasDelta = false;
+  for (const entry of raw) {
+    if (entry.typeCode === 6 || entry.typeCode === 7) {
+      hasDelta = true;
+      break;
+    }
+  }
+  if (!hasDelta) {
+    for (const entry of raw) {
+      const type = CODE_TYPE[entry.typeCode] as GitObjectType;
+      const oid = hashObject(type, entry.data);
+      if (!objects.has(oid)) objects.set(oid, { type, data: entry.data });
+    }
+    return objects;
+  }
   const resolvedByOid = new Map<string, RawPackEntry>();
   const resolving = new Set<number>();
   const resolve = (entry: RawPackEntry): { type: GitObjectType; data: Buffer; oid: string } => {
@@ -444,41 +465,62 @@ export function readPack(pack: Buffer, resolveBase?: (oid: string) => GitObject 
   return objects;
 }
 
-function packObjectHeader(type: GitObjectType, size: number): Buffer {
+/** The pack entry header's byte length for an object of `size`. */
+function packHeaderLength(size: number): number {
+  let length = 1;
+  let remaining = Math.floor(size / 16);
+  while (remaining > 0) {
+    length += 1;
+    remaining = Math.floor(remaining / 128);
+  }
+  return length;
+}
+
+/** Write a pack entry header into `target` at `offset`; returns bytes written. */
+function writePackHeader(target: Buffer, offset: number, type: GitObjectType, size: number): number {
   const code = TYPE_CODE[type];
-  const bytes: number[] = [];
   let remaining = size;
   let first = (code << 4) | (remaining & 0x0f);
   remaining = Math.floor(remaining / 16);
+  let written = 0;
   while (remaining > 0) {
-    bytes.push(first | 0x80);
+    target[offset + written] = first | 0x80;
+    written += 1;
     first = remaining & 0x7f;
     remaining = Math.floor(remaining / 128);
   }
-  bytes.push(first);
-  return Buffer.from(bytes);
+  target[offset + written] = first;
+  return written + 1;
 }
 
 /**
  * Build a version-2 packfile from plain objects (no deltas). The caller
  * supplies each object's deflated bytes, so a hot cache can skip
- * recompression. Entries are emitted in the given order.
+ * recompression. Entries are emitted in the given order. The whole pack
+ * is assembled in one allocation: header, entries, then the SHA-1 trailer
+ * over everything before it.
  */
 export function buildPack(items: readonly { type: GitObjectType; size: number; deflated: Buffer }[]): Buffer {
-  const parts: Buffer[] = [];
-  const header = Buffer.allocUnsafe(12);
-  header.write('PACK', 0, 4, 'ascii');
-  header.writeUInt32BE(2, 4);
-  header.writeUInt32BE(items.length, 8);
-  parts.push(header);
+  let bodyLength = 12;
+  for (const item of items) bodyLength += packHeaderLength(item.size) + item.deflated.length;
+  const pack = Buffer.allocUnsafe(bodyLength + 20);
+  pack.write('PACK', 0, 4, 'ascii');
+  pack.writeUInt32BE(2, 4);
+  pack.writeUInt32BE(items.length, 8);
+  let offset = 12;
   for (const item of items) {
-    parts.push(packObjectHeader(item.type, item.size));
-    parts.push(item.deflated);
+    offset += writePackHeader(pack, offset, item.type, item.size);
+    item.deflated.copy(pack, offset);
+    offset += item.deflated.length;
   }
-  const body = Buffer.concat(parts);
-  return Buffer.concat([body, createHash('sha1').update(body).digest()]);
+  createHash('sha1').update(pack.subarray(0, bodyLength)).digest().copy(pack, bodyLength);
+  return pack;
 }
 
 export function deflateObject(data: Buffer): Buffer {
-  return deflateSync(data);
+  // Level 1: a valid zlib stream is all a pack entry needs, and the
+  // fastest level compresses the small objects of a fetch far quicker
+  // than the default. The pack trailer is computed over the bytes as
+  // emitted, so nothing downstream can tell the level.
+  return deflateSync(data, { level: 1 });
 }

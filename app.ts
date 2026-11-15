@@ -27,6 +27,9 @@ export interface AppOptions {
 }
 
 function decodeSegment(segment: string): string {
+  // No percent escape, nothing to decode: the common case for the paths
+  // the suite drives.
+  if (segment.indexOf('%') < 0) return segment;
   try {
     return decodeURIComponent(segment);
   } catch {
@@ -42,6 +45,11 @@ function parseQuery(raw: string): Map<string, string> {
     const eq = pair.indexOf('=');
     const key = eq < 0 ? pair : pair.slice(0, eq);
     const value = eq < 0 ? '' : pair.slice(eq + 1);
+    // No escape or plus: the decoded form is the raw form.
+    if (key.indexOf('%') < 0 && key.indexOf('+') < 0 && value.indexOf('%') < 0 && value.indexOf('+') < 0) {
+      query.set(key, value);
+      continue;
+    }
     try {
       query.set(decodeURIComponent(key.replace(/\+/g, ' ')), decodeURIComponent(value.replace(/\+/g, ' ')));
     } catch {
@@ -56,15 +64,22 @@ function splitPath(rawUrl: string): { segments: string[]; query: Map<string, str
   const rawPath = q < 0 ? rawUrl : rawUrl.slice(0, q);
   const query = parseQuery(q < 0 ? '' : rawUrl.slice(q + 1));
   const trimmed = rawPath.length > 1 && rawPath.endsWith('/') ? rawPath.slice(0, -1) : rawPath;
-  const segments = trimmed
-    .split('/')
-    .filter((segment) => segment !== '')
-    .map(decodeSegment);
+  // One pass: split on '/', drop empties, decode. Equivalent to
+  // split('/').filter(non-empty).map(decodeSegment) with no intermediates.
+  const segments: string[] = [];
+  let start = 0;
+  for (let i = 0; i <= trimmed.length; i += 1) {
+    if (i === trimmed.length || trimmed.charCodeAt(i) === 47) {
+      if (i > start) segments.push(decodeSegment(trimmed.slice(start, i)));
+      start = i + 1;
+    }
+  }
   return { segments, query, path: trimmed };
 }
 
 function readBody(request: IncomingMessage): Promise<Buffer> {
   return new Promise((resolvePromise, rejectPromise) => {
+    let first: Buffer | null = null;
     const chunks: Buffer[] = [];
     let total = 0;
     request.on('data', (chunk: Buffer) => {
@@ -74,11 +89,40 @@ function readBody(request: IncomingMessage): Promise<Buffer> {
         request.destroy();
         return;
       }
-      chunks.push(chunk);
+      // The usual case is one chunk: return it directly, no copy.
+      if (first === null) first = chunk;
+      else chunks.push(chunk);
     });
-    request.on('end', () => resolvePromise(Buffer.concat(chunks)));
+    request.on('end', () => {
+      if (first === null) resolvePromise(EMPTY_BODY);
+      else if (chunks.length === 0) resolvePromise(first);
+      else resolvePromise(Buffer.concat([first, ...chunks]));
+    });
     request.on('error', rejectPromise);
   });
+}
+
+/** The shared empty body: no request body, no allocation. */
+const EMPTY_BODY = Buffer.alloc(0);
+
+/**
+ * Whether a request can carry a body at all. HTTP/1.1 says a request
+ * without Content-Length or Transfer-Encoding has none, and
+ * Content-Length: 0 means an empty one; skipping the read in those cases
+ * leaves no bytes on the socket, so keep-alive is unaffected.
+ */
+function requestHasBody(request: IncomingMessage): boolean {
+  const length = request.headers['content-length'];
+  if (length !== undefined) {
+    if (Array.isArray(length)) return true;
+    if (length !== '0') return true;
+  }
+  return request.headers['transfer-encoding'] !== undefined;
+}
+
+/** Read the request body, or the shared empty buffer when it has none. */
+function readRequestBody(request: IncomingMessage): Promise<Buffer> {
+  return requestHasBody(request) ? readBody(request) : Promise.resolve(EMPTY_BODY);
 }
 
 function parseJsonBody(buffer: Buffer): unknown {
@@ -101,19 +145,26 @@ export function createApp(options: AppOptions): { server: Server; store: Store }
   async function handleRequest(request: IncomingMessage, response: ServerResponse): Promise<void> {
     requestCounter += 1;
     const requestId = String(requestCounter);
-    const sendJson = (status: number, json: unknown, extra?: Record<string, string>): void => {
+    const sendJson = (result: JsonResult): void => {
       const headers: Record<string, string> = {
         'content-type': 'application/json',
         'x-github-request-id': requestId,
-        ...(extra ?? {}),
+        ...(result.headers ?? {}),
       };
-      if (json === null) {
-        response.writeHead(status, headers);
+      // A pre-serialized body goes out as-is: no object rebuild, no
+      // stringify, no copy. Handlers serve cached bytes this way.
+      if (result.body !== undefined) {
+        response.writeHead(result.status, { ...headers, 'content-length': String(result.body.length) });
+        response.end(result.body);
+        return;
+      }
+      if (result.json === null) {
+        response.writeHead(result.status, headers);
         response.end();
         return;
       }
-      const body = Buffer.from(JSON.stringify(json), 'utf8');
-      response.writeHead(status, { ...headers, 'content-length': String(body.length) });
+      const body = Buffer.from(JSON.stringify(result.json), 'utf8');
+      response.writeHead(result.status, { ...headers, 'content-length': String(body.length) });
       response.end(body);
     };
     const sendBinary = (result: BinResult): void => {
@@ -133,7 +184,7 @@ export function createApp(options: AppOptions): { server: Server; store: Store }
 
       // Health check: no auth, always 200.
       if (method === 'GET' && path === '/healthz') {
-        sendJson(200, { ok: true });
+        sendJson({ status: 200, json: { ok: true } });
         return;
       }
 
@@ -144,13 +195,13 @@ export function createApp(options: AppOptions): { server: Server; store: Store }
         authorization.startsWith('Bearer ') &&
         (expected === undefined ? authorization.slice(7).trim() !== '' : authorization === `Bearer ${expected}`);
       if (!authorized) {
-        sendJson(401, { message: 'Bad credentials' });
+        sendJson({ status: 401, json: { message: 'Bad credentials' } });
         return;
       }
 
       // REST v3.
       if (segments[0] === 'api' && segments[1] === 'v3') {
-        const body = parseJsonBody(await readBody(request));
+        const body = parseJsonBody(await readRequestBody(request));
         const ctx: RestContext = {
           store,
           segments: segments.slice(2),
@@ -161,23 +212,23 @@ export function createApp(options: AppOptions): { server: Server; store: Store }
           origin: `http://${host}`,
         };
         const result: JsonResult = handleRest(ctx);
-        sendJson(result.status, result.json, result.headers);
+        sendJson(result);
         return;
       }
 
       // GraphQL.
       if (method === 'POST' && segments[0] === 'api' && segments[1] === 'graphql' && segments.length === 2) {
-        const body = parseJsonBody(await readBody(request));
+        const body = parseJsonBody(await readRequestBody(request));
         const result = handleGraphQL(store, body);
-        sendJson(result.status, result.json, result.headers);
+        sendJson(result);
         return;
       }
 
       // MCP.
       if (method === 'POST' && segments[0] === 'mcp' && segments.length === 1) {
-        const body = await readBody(request);
+        const body = await readRequestBody(request);
         const result = handleMcp(store, body);
-        sendJson(result.status, result.json, result.headers);
+        sendJson(result);
         return;
       }
 
@@ -199,27 +250,27 @@ export function createApp(options: AppOptions): { server: Server; store: Store }
           return;
         }
         if (service === 'git-upload-pack' && method === 'POST') {
-          const body = await readBody(request);
+          const body = await readRequestBody(request);
           const result = handleUploadPack(store, owner, repoName, body, request.headers['git-protocol']);
           sendBinary(result);
           return;
         }
         if (service === 'git-receive-pack' && method === 'POST') {
-          const body = await readBody(request);
+          const body = await readRequestBody(request);
           const result = handleReceivePack(store, owner, repoName, body);
           sendBinary(result);
           return;
         }
       }
 
-      sendJson(404, { message: 'Not Found' });
+      sendJson({ status: 404, json: { message: 'Not Found' } });
     } catch (err) {
       if (err instanceof HttpError) {
-        sendJson(err.status, { message: err.message });
+        sendJson({ status: err.status, json: { message: err.message } });
         return;
       }
       process.stderr.write(`forge: internal error: ${(err as Error).stack ?? (err as Error).message}\n`);
-      if (!response.headersSent) sendJson(500, { message: 'Internal Server Error' });
+      if (!response.headersSent) sendJson({ status: 500, json: { message: 'Internal Server Error' } });
       else response.end();
     }
   }

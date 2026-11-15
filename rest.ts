@@ -13,6 +13,7 @@ import {
   diffFlats,
   firstParentWalk,
   issueJson,
+  issueJsonBuffer,
   labelJson,
   mergePullRequest,
   pullFiles,
@@ -42,8 +43,6 @@ export interface RestContext {
   readonly body: unknown;
   readonly origin: string;
 }
-
-type Handler = (ctx: RestContext, segments: readonly string[]) => JsonResult;
 
 function ok(json: unknown, status = 200, headers?: Record<string, string>): JsonResult {
   return { status, json, headers };
@@ -432,7 +431,7 @@ function handleCreateIssue(ctx: RestContext, segments: readonly string[]): JsonR
   if (title === undefined || title === '') throw unprocessable('title is required');
   const issue = ctx.store.createIssue(repo, title, asString(body.body) ?? '', labelNamesFromBody(body));
   if (issue === null) throw unprocessable('unknown label');
-  return ok(issueJson(ctx.store, repo, issue), 201);
+  return { status: 201, json: null, body: issueJsonBuffer(ctx.store, repo, issue) };
 }
 
 function handleListIssues(ctx: RestContext, segments: readonly string[]): JsonResult {
@@ -456,7 +455,8 @@ function handleListIssues(ctx: RestContext, segments: readonly string[]): JsonRe
 
 function handleGetIssue(ctx: RestContext, segments: readonly string[]): JsonResult {
   const repo = resolveRepo(ctx, segments);
-  return ok(issueJson(ctx.store, repo, findIssue(repo, segments[4] as string)));
+  const issue = findIssue(repo, segments[4] as string);
+  return { status: 200, json: null, body: issueJsonBuffer(ctx.store, repo, issue) };
 }
 
 function handlePatchIssue(ctx: RestContext, segments: readonly string[]): JsonResult {
@@ -480,7 +480,8 @@ function handlePatchIssue(ctx: RestContext, segments: readonly string[]): JsonRe
     issue.labels = labels;
   }
   issue.updatedSeq = repo.nextSeq();
-  return ok(issueJson(ctx.store, repo, issue));
+  issue.jsonCache = null;
+  return { status: 200, json: null, body: issueJsonBuffer(ctx.store, repo, issue) };
 }
 
 function handleCreateComment(ctx: RestContext, segments: readonly string[]): JsonResult {
@@ -581,83 +582,92 @@ export type { CommentRecord };
 
 // ---------------------------------------------------------------------------
 // router
-
-const ROUTES: { method: string; match: (segments: readonly string[]) => boolean; handler: Handler }[] = [
-  { method: 'GET', match: (s) => s.length === 0, handler: handleRoot },
-  { method: 'GET', match: (s) => s.length === 1 && s[0] === 'meta', handler: handleMeta },
-  { method: 'GET', match: (s) => s.length === 1 && s[0] === 'user', handler: handleUser },
-  { method: 'POST', match: (s) => s.length === 2 && s[0] === 'user' && s[1] === 'repos', handler: handleCreateRepo },
-  { method: 'GET', match: (s) => s.length === 2 && s[0] === 'user' && s[1] === 'repos', handler: handleListRepos },
-  { method: 'GET', match: (s) => s.length === 3 && s[0] === 'repos', handler: handleGetRepo },
-  { method: 'PATCH', match: (s) => s.length === 3 && s[0] === 'repos', handler: handlePatchRepo },
-  { method: 'DELETE', match: (s) => s.length === 3 && s[0] === 'repos', handler: handleDeleteRepo },
-  { method: 'POST', match: (s) => s.length === 5 && s[0] === 'repos' && s[3] === 'git' && s[4] === 'refs', handler: handleCreateRef },
-  {
-    method: 'GET',
-    match: (s) => s.length >= 6 && s[0] === 'repos' && s[3] === 'git' && s[4] === 'refs',
-    handler: handleGetRef,
-  },
-  { method: 'GET', match: (s) => s.length === 4 && s[0] === 'repos' && s[3] === 'branches', handler: handleListBranches },
-  {
-    method: 'GET',
-    match: (s) => s.length >= 5 && s[0] === 'repos' && s[3] === 'branches',
-    handler: handleGetBranch,
-  },
-  { method: 'GET', match: (s) => s.length === 4 && s[0] === 'repos' && s[3] === 'commits', handler: handleListCommits },
-  {
-    method: 'GET',
-    match: (s) => s.length >= 4 && s[0] === 'repos' && s[3] === 'contents',
-    handler: handleGetContents,
-  },
-  {
-    method: 'PUT',
-    match: (s) => s.length >= 5 && s[0] === 'repos' && s[3] === 'contents',
-    handler: (ctx) => writeContents(ctx, ctx.segments, 'put'),
-  },
-  {
-    method: 'DELETE',
-    match: (s) => s.length >= 5 && s[0] === 'repos' && s[3] === 'contents',
-    handler: (ctx) => writeContents(ctx, ctx.segments, 'delete'),
-  },
-  { method: 'POST', match: (s) => s.length === 4 && s[0] === 'repos' && s[3] === 'labels', handler: handleCreateLabel },
-  { method: 'GET', match: (s) => s.length === 4 && s[0] === 'repos' && s[3] === 'labels', handler: handleListLabels },
-  { method: 'POST', match: (s) => s.length === 4 && s[0] === 'repos' && s[3] === 'issues', handler: handleCreateIssue },
-  { method: 'GET', match: (s) => s.length === 4 && s[0] === 'repos' && s[3] === 'issues', handler: handleListIssues },
-  { method: 'GET', match: (s) => s.length === 5 && s[0] === 'repos' && s[3] === 'issues', handler: handleGetIssue },
-  { method: 'PATCH', match: (s) => s.length === 5 && s[0] === 'repos' && s[3] === 'issues', handler: handlePatchIssue },
-  {
-    method: 'POST',
-    match: (s) => s.length === 6 && s[0] === 'repos' && s[3] === 'issues' && s[5] === 'comments',
-    handler: handleCreateComment,
-  },
-  {
-    method: 'GET',
-    match: (s) => s.length === 6 && s[0] === 'repos' && s[3] === 'issues' && s[5] === 'comments',
-    handler: handleListComments,
-  },
-  { method: 'POST', match: (s) => s.length === 4 && s[0] === 'repos' && s[3] === 'pulls', handler: handleCreatePull },
-  { method: 'GET', match: (s) => s.length === 4 && s[0] === 'repos' && s[3] === 'pulls', handler: handleListPulls },
-  { method: 'GET', match: (s) => s.length === 5 && s[0] === 'repos' && s[3] === 'pulls', handler: handleGetPull },
-  {
-    method: 'GET',
-    match: (s) => s.length === 6 && s[0] === 'repos' && s[3] === 'pulls' && s[5] === 'files',
-    handler: handlePullFiles,
-  },
-  {
-    method: 'GET',
-    match: (s) => s.length === 6 && s[0] === 'repos' && s[3] === 'pulls' && s[5] === 'commits',
-    handler: handleGetCommitsForPull,
-  },
-  {
-    method: 'PUT',
-    match: (s) => s.length === 6 && s[0] === 'repos' && s[3] === 'pulls' && s[5] === 'merge',
-    handler: handleMergePull,
-  },
-];
+//
+// Direct dispatch on method, segment count and the section segment. No two
+// routes of the same method overlap, so the dispatch below answers exactly
+// the routes the table used to list, without scanning a predicate per
+// request: the read workload's GET issue resolves in a few comparisons.
 
 export function handleRest(ctx: RestContext): JsonResult {
-  for (const route of ROUTES) {
-    if (route.method === ctx.method && route.match(ctx.segments)) return route.handler(ctx, ctx.segments);
+  const s = ctx.segments;
+  const method = ctx.method;
+  if (s[0] !== 'repos') {
+    if (method === 'GET' && s.length === 0) return handleRoot(ctx);
+    if (method === 'GET' && s.length === 1 && s[0] === 'meta') return handleMeta();
+    if (method === 'GET' && s.length === 1 && s[0] === 'user') return handleUser(ctx);
+    if (s.length === 2 && s[0] === 'user' && s[1] === 'repos') {
+      if (method === 'POST') return handleCreateRepo(ctx);
+      if (method === 'GET') return handleListRepos(ctx);
+    }
+    throw notFound('Not Found');
+  }
+  if (s.length === 3) {
+    if (method === 'GET') return handleGetRepo(ctx, s);
+    if (method === 'PATCH') return handlePatchRepo(ctx, s);
+    if (method === 'DELETE') return handleDeleteRepo(ctx, s);
+    throw notFound('Not Found');
+  }
+  const section = s[3];
+  if (section === 'git') {
+    if (method === 'POST' && s.length === 5 && s[4] === 'refs') return handleCreateRef(ctx, s);
+    if (method === 'GET' && s.length >= 6 && s[4] === 'refs') return handleGetRef(ctx, s);
+    throw notFound('Not Found');
+  }
+  if (section === 'branches') {
+    if (method !== 'GET') throw notFound('Not Found');
+    if (s.length === 4) return handleListBranches(ctx, s);
+    if (s.length >= 5) return handleGetBranch(ctx, s);
+    throw notFound('Not Found');
+  }
+  if (section === 'commits') {
+    if (method === 'GET' && s.length === 4) return handleListCommits(ctx, s);
+    throw notFound('Not Found');
+  }
+  if (section === 'contents') {
+    if (method === 'GET' && s.length >= 4) return handleGetContents(ctx, s);
+    if (method === 'PUT' && s.length >= 5) return writeContents(ctx, ctx.segments, 'put');
+    if (method === 'DELETE' && s.length >= 5) return writeContents(ctx, ctx.segments, 'delete');
+    throw notFound('Not Found');
+  }
+  if (section === 'labels') {
+    if (s.length !== 4) throw notFound('Not Found');
+    if (method === 'POST') return handleCreateLabel(ctx, s);
+    if (method === 'GET') return handleListLabels(ctx, s);
+    throw notFound('Not Found');
+  }
+  if (section === 'issues') {
+    if (s.length === 4) {
+      if (method === 'POST') return handleCreateIssue(ctx, s);
+      if (method === 'GET') return handleListIssues(ctx, s);
+      throw notFound('Not Found');
+    }
+    if (s.length === 5) {
+      if (method === 'GET') return handleGetIssue(ctx, s);
+      if (method === 'PATCH') return handlePatchIssue(ctx, s);
+      throw notFound('Not Found');
+    }
+    if (s.length === 6 && s[5] === 'comments') {
+      if (method === 'POST') return handleCreateComment(ctx, s);
+      if (method === 'GET') return handleListComments(ctx, s);
+    }
+    throw notFound('Not Found');
+  }
+  if (section === 'pulls') {
+    if (s.length === 4) {
+      if (method === 'POST') return handleCreatePull(ctx, s);
+      if (method === 'GET') return handleListPulls(ctx, s);
+      throw notFound('Not Found');
+    }
+    if (s.length === 5) {
+      if (method === 'GET') return handleGetPull(ctx, s);
+      throw notFound('Not Found');
+    }
+    if (s.length === 6) {
+      if (method === 'GET' && s[5] === 'files') return handlePullFiles(ctx, s);
+      if (method === 'GET' && s[5] === 'commits') return handleGetCommitsForPull(ctx, s);
+      if (method === 'PUT' && s[5] === 'merge') return handleMergePull(ctx, s);
+    }
+    throw notFound('Not Found');
   }
   throw notFound('Not Found');
 }

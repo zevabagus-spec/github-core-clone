@@ -1068,6 +1068,7 @@ function executeMutationField(exec: Executor, field: FieldNode): unknown {
     if (repo === undefined || issue === undefined) return null;
     issue.state = 'closed';
     issue.updatedSeq = repo.nextSeq();
+    issue.jsonCache = null;
     const payload: Record<string, unknown> = {
       __concreteType: 'CloseIssuePayload',
       issue: issueObject(exec, repo, issue),

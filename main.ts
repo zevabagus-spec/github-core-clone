@@ -87,6 +87,10 @@ async function main(): Promise<void> {
   const token = process.env.MAKEFUN_SHOP_TOKEN;
 
   const { server } = createApp({ token });
+  // The suite's read workload reuses one keep-alive connection for 2,000
+  // requests; a long keep-alive timeout keeps that socket warm across the
+  // suite's phases on a loaded pod instead of dropping it mid-benchmark.
+  server.keepAliveTimeout = 120_000;
   const port = await new Promise<number>((resolvePromise, rejectPromise) => {
     server.once('error', rejectPromise);
     server.listen(0, '127.0.0.1', () => {
