@@ -7,24 +7,24 @@
 // advertisements do; sideband band 1 carries the packfile in fetch
 // replies and the report stream in receive-pack replies; receive-pack
 // unpacks before it evaluates any ref update.
+//
+// Upload-pack is read-only, so a second request with byte-identical body
+// against an unchanged repository answers from a raw-body cache without
+// decoding the packets at all. Receive-pack mutates state and is never
+// cached that way.
 
 import {
   buildPack,
   decodePktLines,
-  encodePktLines,
-  hashObject,
+  encodePktText,
   isOid,
-  parseCommit,
-  parseTag,
   readPack,
   ZERO_OID,
   type GitObject,
-  type PktItem,
 } from './gitobj.ts';
 import {
   ancestorSet,
   isAncestor,
-  FIXED_TIME,
   type RepoState,
   type Store,
 } from './store.ts';
@@ -33,7 +33,7 @@ import { HttpError, type BinResult } from './types.ts';
 const AGENT = 'agent=forge/1.0';
 
 /** The protocol-v2 capability advertisement never varies: build it once. */
-const V2_ADVERTISEMENT = encodePktLines([
+const V2_ADVERTISEMENT = encodePktText([
   'version 2\n',
   'fetch=shallow filter\n',
   'ls-refs=unborn\n',
@@ -41,6 +41,9 @@ const V2_ADVERTISEMENT = encodePktLines([
   `${AGENT}\n`,
   'flush',
 ]);
+
+/** Shared flush packet for sideband replies; Buffer.concat copies it. */
+const SIDEBAND_FLUSH = Buffer.from('0000', 'ascii');
 
 /** Cap on a repository's cached git responses; oldest evicted first. */
 const GIT_RESPONSE_CACHE_MAX = 256;
@@ -135,7 +138,7 @@ function advertiseUploadPack(repo: RepoState, gitProtocol: string | undefined): 
   const cached = gitCacheGet(repo, key);
   if (cached !== undefined) return result('application/x-git-upload-pack-advertisement', cached);
   const caps = `multi_ack_detailed side-band-64k thin-pack ofs-delta shallow ${AGENT} symref=HEAD:${defaultBranchRef(repo)}`;
-  const items: PktItem[] = ['# service=git-upload-pack\n', 'flush'];
+  const items: (string | 'flush')[] = ['# service=git-upload-pack\n', 'flush'];
   const refs = refLines(repo);
   const headTip = repo.branchTip(repo.defaultBranch);
   if (headTip !== undefined) {
@@ -153,7 +156,7 @@ function advertiseUploadPack(repo: RepoState, gitProtocol: string | undefined): 
     }
   }
   items.push('flush');
-  const body = encodePktLines(items);
+  const body = encodePktText(items);
   gitCacheSet(repo, key, body);
   return result('application/x-git-upload-pack-advertisement', body);
 }
@@ -163,7 +166,7 @@ function advertiseReceivePack(repo: RepoState): BinResult {
   const cached = gitCacheGet(repo, key);
   if (cached !== undefined) return result('application/x-git-receive-pack-advertisement', cached);
   const caps = `report-status side-band-64k delete-refs ofs-delta ${AGENT} symref=HEAD:${defaultBranchRef(repo)}`;
-  const items: PktItem[] = ['# service=git-receive-pack\n', 'flush'];
+  const items: (string | 'flush')[] = ['# service=git-receive-pack\n', 'flush'];
   const refs = refLines(repo);
   const headTip = repo.branchTip(repo.defaultBranch);
   if (headTip !== undefined) {
@@ -181,7 +184,7 @@ function advertiseReceivePack(repo: RepoState): BinResult {
     }
   }
   items.push('flush');
-  const body = encodePktLines(items);
+  const body = encodePktText(items);
   gitCacheSet(repo, key, body);
   return result('application/x-git-receive-pack-advertisement', body);
 }
@@ -189,10 +192,13 @@ function advertiseReceivePack(repo: RepoState): BinResult {
 // ---------------------------------------------------------------------------
 // sideband
 
+/** Largest data payload a sideband packet carries: 65520 minus the 4-byte length and the band byte. */
+const SIDEBAND_MAX_CHUNK = 65515;
+
 /** Chunk bytes into sideband band-1 packets (≤65515 data bytes each). */
 function sidebandPackets(band: number, data: Buffer): Buffer[] {
   const packets: Buffer[] = [];
-  const maxChunk = 65515;
+  const maxChunk = SIDEBAND_MAX_CHUNK;
   for (let offset = 0; offset < data.length; offset += maxChunk) {
     const chunk = data.subarray(offset, Math.min(data.length, offset + maxChunk));
     const packet = Buffer.allocUnsafe(4 + 1 + chunk.length);
@@ -208,10 +214,6 @@ function sidebandPackets(band: number, data: Buffer): Buffer[] {
     packets.push(packet);
   }
   return packets;
-}
-
-function sidebandFlush(): Buffer {
-  return Buffer.from('0000', 'ascii');
 }
 
 // ---------------------------------------------------------------------------
@@ -312,8 +314,10 @@ function planFetch(
     wantCommits.add(oid);
     depthOf.set(oid, at);
     if (depth === null || at < depth) {
-      const commit = repo.parseCommit(oid) as ReturnType<typeof parseCommit>;
-      for (const parent of commit.parents) queue.push({ oid: parent, depth: at + 1 });
+      const commit = repo.parseCommit(oid);
+      if (commit !== null) {
+        for (const parent of commit.parents) queue.push({ oid: parent, depth: at + 1 });
+      }
     }
   }
 
@@ -354,7 +358,7 @@ function planFetch(
   // The wanted closure is walked once here, not once per have.
   const wantAncestors = haves.length > 0 && wants.length > 0 ? ancestorSet(repo, wants[0] as string) : null;
   for (const have of haves) {
-    if (wantCommits.has(have) || haveClosure.has(have) && wantCommits.size > 0) {
+    if (wantCommits.has(have) || (haveClosure.has(have) && wantCommits.size > 0)) {
       // The first have that lies in the wanted closure is acknowledged.
       if ((wantAncestors !== null && wantAncestors.has(have)) || wantCommits.has(have)) {
         ack = have;
@@ -402,9 +406,17 @@ export function handleUploadPack(
 ): BinResult {
   const repo = resolveGitRepo(store, owner, repoName);
   const isV2 = gitProtocol !== undefined && gitProtocol.split(' ').includes('version=2');
+  // Raw-body cache: identical bytes against an identical repository state
+  // always answer identically, and upload-pack never mutates state. The
+  // latin1 string is a faithful 1:1 view of the bytes. Errors are never
+  // cached: they throw before the set below runs.
+  const rawKey = `raw|${isV2 ? 2 : 0}|${gitFingerprint(repo)}|${body.toString('latin1')}`;
+  const rawCached = gitCacheGet(repo, rawKey);
+  if (rawCached !== undefined) return result('application/x-git-upload-pack-result', rawCached);
   const { packets } = decodePktLines(body, 0, false);
-  if (isV2) return handleUploadPackV2(repo, packets);
-  return handleUploadPackV0(repo, packets);
+  const answered = isV2 ? handleUploadPackV2(repo, packets) : handleUploadPackV0(repo, packets);
+  gitCacheSet(repo, rawKey, answered.body);
+  return answered;
 }
 
 interface V2Request {
@@ -458,7 +470,7 @@ function lsRefsV2(repo: RepoState, args: readonly string[]): BinResult {
   const cached = gitCacheGet(repo, key);
   if (cached !== undefined) return result('application/x-git-upload-pack-result', cached);
   const matchPrefix = (name: string): boolean => prefixes.length === 0 || prefixes.some((p) => name.startsWith(p));
-  const items: PktItem[] = [];
+  const items: (string | 'flush')[] = [];
   const headTip = repo.branchTip(repo.defaultBranch);
   const headName = 'HEAD';
   if (headTip !== undefined) {
@@ -479,7 +491,7 @@ function lsRefsV2(repo: RepoState, args: readonly string[]): BinResult {
     items.push(`${text}\n`);
   }
   items.push('flush');
-  const body = encodePktLines(items);
+  const body = encodePktText(items);
   gitCacheSet(repo, key, body);
   return result('application/x-git-upload-pack-result', body);
 }
@@ -523,25 +535,23 @@ function fetchV2(repo: RepoState, args: readonly string[]): BinResult {
 
   let body: Buffer;
   if (!hasDone && plan.ack === null) {
-    const ackItems: PktItem[] = ['acknowledgments\n', 'NAK\n', 'flush'];
-    body = encodePktLines(ackItems);
+    body = encodePktText(['acknowledgments\n', 'NAK\n', 'flush']);
   } else {
     const pack = buildFetchPack(repo, plan.send);
     const sections: Buffer[] = [];
     if (!hasDone) {
-      const ackItems: PktItem[] = ['acknowledgments\n', `ACK ${plan.ack as string}\n`, 'ready\n', 'delim'];
-      sections.push(encodePktLines(ackItems));
+      sections.push(encodePktText(['acknowledgments\n', `ACK ${plan.ack as string}\n`, 'ready\n', 'delim']));
     }
     if (shallowApplies) {
-      const shallowItems: PktItem[] = ['shallow-info\n'];
+      const shallowItems: (string | 'delim')[] = ['shallow-info\n'];
       for (const oid of plan.shallow) shallowItems.push(`shallow ${oid}\n`);
       for (const oid of plan.unshallow) shallowItems.push(`unshallow ${oid}\n`);
       shallowItems.push('delim');
-      sections.push(encodePktLines(shallowItems));
+      sections.push(encodePktText(shallowItems));
     }
-    sections.push(encodePktLines(['packfile\n']));
+    sections.push(encodePktText(['packfile\n']));
     sections.push(Buffer.concat(sidebandPackets(1, pack)));
-    sections.push(sidebandFlush());
+    sections.push(SIDEBAND_FLUSH);
     body = Buffer.concat(sections);
   }
   gitCacheSet(repo, key, body);
@@ -557,7 +567,6 @@ function handleUploadPackV0(
   const shallowLines: string[] = [];
   let depth: number | null = null;
   let seenFlush = false;
-  let firstWant = true;
   for (const packet of packets) {
     if (packet.kind === 'flush') {
       seenFlush = true;
@@ -573,14 +582,12 @@ function handleUploadPackV0(
         const rest = text.slice(5);
         const oid = rest.split(/[\0 ]/, 1)[0] as string;
         wants.push(oid.trim());
-        firstWant = false;
       } else if (text.startsWith('shallow ')) {
         shallowLines.push(text.slice(8).trim());
       } else if (text.startsWith('deepen ')) {
         const parsed = Number.parseInt(text.slice(7), 10);
         if (Number.isFinite(parsed) && parsed > 0) depth = depth === null ? parsed : Math.min(depth, parsed);
       }
-      void firstWant;
     } else {
       if (text.startsWith('have ')) haves.push(text.slice(5).trim());
       // "done" ends the have list; nothing to do.
@@ -593,14 +600,14 @@ function handleUploadPackV0(
   const pack = buildFetchPack(repo, plan.send);
 
   const parts: Buffer[] = [];
-  const prefix: PktItem[] = [];
+  const prefix: string[] = [];
   for (const oid of plan.shallow) prefix.push(`shallow ${oid}\n`);
   for (const oid of plan.unshallow) prefix.push(`unshallow ${oid}\n`);
   if (plan.ack !== null) prefix.push(`ACK ${plan.ack}\n`);
   else prefix.push('NAK\n');
-  parts.push(encodePktLines(prefix));
+  parts.push(encodePktText(prefix));
   parts.push(Buffer.concat(sidebandPackets(1, pack)));
-  parts.push(sidebandFlush());
+  parts.push(SIDEBAND_FLUSH);
   const body = Buffer.concat(parts);
   gitCacheSet(repo, key, body);
   return result('application/x-git-upload-pack-result', body);
@@ -668,7 +675,7 @@ export function handleReceivePack(
     unpackError = 'missing packfile';
   }
 
-  const report: string[] = [];
+  const report: (string | 'flush')[] = [];
   if (unpackOk) {
     report.push('unpack ok\n');
     for (const cmd of commands) report.push(evaluateCommand(repo, cmd));
@@ -678,12 +685,12 @@ export function handleReceivePack(
   }
   report.push('flush');
 
+  const stream = encodePktText(report);
   let payload: Buffer;
   if (wantsSideband) {
-    const stream = encodePktLines(report.map((line) => (line === 'flush' ? 'flush' : line) as PktItem));
-    payload = Buffer.concat([...sidebandPackets(1, stream), sidebandFlush()]);
+    payload = Buffer.concat([...sidebandPackets(1, stream), SIDEBAND_FLUSH]);
   } else {
-    payload = encodePktLines(report.map((line) => (line === 'flush' ? 'flush' : line) as PktItem));
+    payload = stream;
   }
   return result('application/x-git-receive-pack-result', payload);
 }
@@ -731,11 +738,3 @@ function evaluateCommand(repo: RepoState, cmd: RefCommand): string {
   repo.refs.set(cmd.ref, cmd.newOid);
   return ok;
 }
-
-// Keep the unused imports honest for strict builds.
-export function _gitprotoDiagnostics(): { fixedTime: string; hashExample: string } {
-  return { fixedTime: FIXED_TIME, hashExample: hashObject('blob', Buffer.from('')) };
-}
-
-export type { GitObject };
-export { parseCommit, parseTag };

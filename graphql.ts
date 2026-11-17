@@ -10,7 +10,6 @@
 // GraphQL-created issue reads back over REST with the same number.
 
 import {
-  commentJson,
   decodeGlobalId,
   decodeIssueCursor,
   encodeGlobalId,
@@ -711,20 +710,20 @@ function connectionObject<T>(
   pageInfo: Record<string, unknown>,
   edgeType: string,
 ): Record<string, unknown> {
-  const edges = nodes.map((item, index) => {
-    const node = toNode(item);
-    return {
-      __concreteType: edgeType,
-      node,
-      cursor: encodeGlobalId('Cursor', index),
-    };
-  });
+  // Each node object is built once and shared between the nodes list and
+  // its edge: the executor only reads them, so sharing is invisible.
+  const built = nodes.map(toNode);
+  const edges = built.map((node, index) => ({
+    __concreteType: edgeType,
+    node,
+    cursor: encodeGlobalId('Cursor', index),
+  }));
   return {
     __concreteType: 'Connection',
-    nodes: nodes.map(toNode),
+    nodes: built,
     edges,
     pageInfo,
-    totalCount: nodes.length,
+    totalCount: built.length,
   };
 }
 
@@ -1199,17 +1198,12 @@ function executeOperation(
     if ('typeCondition' in node) continue;
     if (operation.operationType === 'mutation') {
       const value = executeMutationField(exec, node);
-      data[responseKey(node)] = value === null ? null : expandPayload(exec, node, value);
+      data[responseKey(node)] = value;
     } else {
       data[responseKey(node)] = executeField(exec, rootType, {}, node);
     }
   }
   return { data };
-}
-
-/** Mutation payloads were already expanded by their executors; pass through. */
-function expandPayload(_exec: Executor, _field: FieldNode, value: unknown): unknown {
-  return value;
 }
 
 export function handleGraphQL(store: Store, body: unknown): JsonResult {
@@ -1222,9 +1216,4 @@ export function handleGraphQL(store: Store, body: unknown): JsonResult {
   }
   if (body === null || typeof body !== 'object') throw new HttpError(400, 'GraphQL request body must be an object');
   return { status: 200, json: executeOperation(store, body as GraphQLRequestBody) };
-}
-
-// Referenced so strict unused-import checks stay honest.
-export function _graphqlDiagnostics(): { sample: string } {
-  return { sample: commentJson === undefined ? '' : 'ok' };
 }

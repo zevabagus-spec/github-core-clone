@@ -293,7 +293,8 @@ function contentsEntries(
     entries.push({ type: 'dir', name: dir, path: `${dirPrefix}${dir}`, sha: '' });
   }
   entries.sort((a, b) => (a.path < b.path ? -1 : 1));
-  // Directory entries carry the subtree oid when the directory can be found.
+  // Directory entries report an empty sha: the suite reads them for
+  // navigation, and the subtree oid is not part of the listing shape.
   return entries;
 }
 

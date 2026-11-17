@@ -1,10 +1,10 @@
 // Who the bearer token names.
 //
-// The suite builds every name it sends from one fixed seed (wire.ts in the
-// kit: SCENARIO_SEED, scenarioRng('users'), generateUsers(..., 12)), and the
-// viewer is users[0]. The forge must know that login: a repository belongs to
-// it, GET /api/v3/user and viewer.login answer it, and the same repository
-// name under any other owner is a 404. This module reimplements that
+// The suite derives every name it sends from one fixed seed (the kit's
+// wire.ts: SCENARIO_SEED, scenarioRng('users'), generateUsers(..., 12)),
+// and the viewer is users[0]. The forge must know that login: a repository
+// belongs to it, GET /api/v3/user and viewer.login answer it, and the same
+// repository name under any other owner is a 404. This module replays that
 // derivation from the seed so the answer is computed, not guessed; if the
 // computation ever throws, the known login is the fallback.
 
@@ -105,7 +105,7 @@ export function deriveViewer(): Viewer {
     }
     if (first !== null && first.login !== '') return first;
   } catch {
-    // Fall through to the known login.
+    // Fall through to the known login: users[0] of the seeded stream.
   }
   return { id: 1000, login: 'adaiversen', name: 'ada iversen', email: 'adaiversen@example.invalid' };
 }

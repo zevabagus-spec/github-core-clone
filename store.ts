@@ -194,8 +194,14 @@ export class RepoState {
     return out;
   }
 
-  /** Follow annotated tags to the first non-tag object (or the oid itself). */
+  /**
+   * Follow annotated tags to the first non-tag object (or the oid itself).
+   * The common case is not a tag at all: one lookup, no Set. Tag chains
+   * keep the cycle guard.
+   */
   peel(oid: string): string {
+    const first = this.objects.get(oid);
+    if (first === undefined || first.type !== 'tag') return oid;
     let current = oid;
     const seen = new Set<string>();
     for (;;) {
@@ -369,8 +375,26 @@ export function ancestorSet(repo: RepoState, tip: string): Set<string> {
   return seen;
 }
 
+/** Bound on the first-parent fast path in isAncestor; deeper chains use the general walk. */
+const FIRST_PARENT_CAP = 4096;
+
 export function isAncestor(repo: RepoState, maybeAncestor: string, tip: string): boolean {
   if (maybeAncestor === tip) return true;
+  // Fast path: the first-parent chain, with no Set. Pushes are linear, so
+  // the common case answers here. Bounded: deep or cyclic graphs fall
+  // through to the general walk below, which also covers merge second
+  // parents the first-parent chain never visits.
+  let current: string | null = tip;
+  let steps = 0;
+  while (current !== null && steps < FIRST_PARENT_CAP) {
+    const commit = repo.parseCommit(current);
+    if (commit === null) break;
+    const parent = commit.parents[0];
+    if (parent === undefined) break;
+    if (parent === maybeAncestor) return true;
+    current = parent;
+    steps += 1;
+  }
   const seen = new Set<string>();
   const queue: string[] = [tip];
   while (queue.length > 0) {
@@ -390,8 +414,10 @@ export function mergeBase(repo: RepoState, a: string, b: string): string | null 
   const bAncestors = ancestorSet(repo, b);
   const seen = new Set<string>();
   const queue: string[] = [a];
-  while (queue.length > 0) {
-    const oid = queue.shift() as string;
+  let head = 0;
+  while (head < queue.length) {
+    const oid = queue[head] as string;
+    head += 1;
     if (seen.has(oid)) continue;
     seen.add(oid);
     if (bAncestors.has(oid)) return oid;

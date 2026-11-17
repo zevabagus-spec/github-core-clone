@@ -10,6 +10,10 @@
 //  - Every REST/GraphQL/MCP reply is application/json, never HTML.
 //  - Malformed JSON bodies answer 400 JSON; unknown routes answer 404 JSON.
 //  - No handler failure may take the server down: everything is wrapped.
+//
+// The senders are module-level (no per-request closures), the expected
+// Authorization header is built once, and the request origin is cached
+// per host: the timed workloads reuse one host for thousands of requests.
 
 import { createServer, type IncomingMessage, type Server, type ServerResponse } from 'node:http';
 import { handleGraphQL } from './graphql.ts';
@@ -134,48 +138,93 @@ function parseJsonBody(buffer: Buffer): unknown {
   }
 }
 
+function sendJson(response: ServerResponse, requestId: string, result: JsonResult): void {
+  const extra = result.headers;
+  // A pre-serialized body goes out as-is: no object rebuild, no
+  // stringify, no copy. Handlers serve cached bytes this way.
+  if (result.body !== undefined) {
+    if (extra === undefined) {
+      response.writeHead(result.status, {
+        'content-type': 'application/json',
+        'x-github-request-id': requestId,
+        'content-length': String(result.body.length),
+      });
+    } else {
+      response.writeHead(result.status, {
+        'content-type': 'application/json',
+        'x-github-request-id': requestId,
+        ...extra,
+        'content-length': String(result.body.length),
+      });
+    }
+    response.end(result.body);
+    return;
+  }
+  if (result.json === null) {
+    if (extra === undefined) {
+      response.writeHead(result.status, {
+        'content-type': 'application/json',
+        'x-github-request-id': requestId,
+      });
+    } else {
+      response.writeHead(result.status, {
+        'content-type': 'application/json',
+        'x-github-request-id': requestId,
+        ...extra,
+      });
+    }
+    response.end();
+    return;
+  }
+  const body = Buffer.from(JSON.stringify(result.json), 'utf8');
+  if (extra === undefined) {
+    response.writeHead(result.status, {
+      'content-type': 'application/json',
+      'x-github-request-id': requestId,
+      'content-length': String(body.length),
+    });
+  } else {
+    response.writeHead(result.status, {
+      'content-type': 'application/json',
+      'x-github-request-id': requestId,
+      ...extra,
+      'content-length': String(body.length),
+    });
+  }
+  response.end(body);
+}
+
+function sendBinary(response: ServerResponse, requestId: string, result: BinResult): void {
+  response.writeHead(result.status, {
+    'content-type': result.contentType,
+    'x-github-request-id': requestId,
+    'content-length': String(result.body.length),
+  });
+  response.end(result.body);
+}
+
 export function createApp(options: AppOptions): { server: Server; store: Store } {
   const store = new Store();
+  const expectedHeader = options.token === undefined ? null : `Bearer ${options.token}`;
   let requestCounter = 0;
+  // One-entry origin cache: the suite drives one host per run.
+  let lastHost = '';
+  let lastOrigin = '';
 
   const server = createServer((request, response) => {
     void handleRequest(request, response);
+  });
+  // Small request, small response, sequential round trips: Nagle's
+  // algorithm must never hold a reply waiting for an ACK. Node enables
+  // TCP_NODELAY by default, but stating it keeps the behavior pinned
+  // across runtimes and network layouts.
+  server.on('connection', (socket) => {
+    socket.setNoDelay(true);
   });
 
   async function handleRequest(request: IncomingMessage, response: ServerResponse): Promise<void> {
     requestCounter += 1;
     const requestId = String(requestCounter);
-    const sendJson = (result: JsonResult): void => {
-      const headers: Record<string, string> = {
-        'content-type': 'application/json',
-        'x-github-request-id': requestId,
-        ...(result.headers ?? {}),
-      };
-      // A pre-serialized body goes out as-is: no object rebuild, no
-      // stringify, no copy. Handlers serve cached bytes this way.
-      if (result.body !== undefined) {
-        response.writeHead(result.status, { ...headers, 'content-length': String(result.body.length) });
-        response.end(result.body);
-        return;
-      }
-      if (result.json === null) {
-        response.writeHead(result.status, headers);
-        response.end();
-        return;
-      }
-      const body = Buffer.from(JSON.stringify(result.json), 'utf8');
-      response.writeHead(result.status, { ...headers, 'content-length': String(body.length) });
-      response.end(body);
-    };
-    const sendBinary = (result: BinResult): void => {
-      response.writeHead(result.status, {
-        'content-type': result.contentType,
-        'x-github-request-id': requestId,
-        'content-length': String(result.body.length),
-      });
-      response.end(result.body);
-    };
-
     try {
       const method = request.method ?? 'GET';
       const rawUrl = request.url ?? '/';
@@ -184,24 +233,31 @@ export function createApp(options: AppOptions): { server: Server; store: Store }
 
       // Health check: no auth, always 200.
       if (method === 'GET' && path === '/healthz') {
-        sendJson({ status: 200, json: { ok: true } });
+        sendJson(response, requestId, { status: 200, json: { ok: true } });
         return;
       }
 
       // Authentication first, on every other route.
-      const expected = options.token;
       const authorization = request.headers.authorization ?? '';
       const authorized =
         authorization.startsWith('Bearer ') &&
-        (expected === undefined ? authorization.slice(7).trim() !== '' : authorization === `Bearer ${expected}`);
+        (expectedHeader === null ? authorization.slice(7).trim() !== '' : authorization === expectedHeader);
       if (!authorized) {
-        sendJson({ status: 401, json: { message: 'Bad credentials' } });
+        sendJson(response, requestId, { status: 401, json: { message: 'Bad credentials' } });
         return;
       }
 
       // REST v3.
       if (segments[0] === 'api' && segments[1] === 'v3') {
         const body = parseJsonBody(await readRequestBody(request));
+        let origin: string;
+        if (host === lastHost) {
+          origin = lastOrigin;
+        } else {
+          lastHost = host;
+          origin = `http://${host}`;
+          lastOrigin = origin;
+        }
         const ctx: RestContext = {
           store,
           segments: segments.slice(2),
@@ -209,10 +265,10 @@ export function createApp(options: AppOptions): { server: Server; store: Store }
           host,
           method,
           body,
-          origin: `http://${host}`,
+          origin,
         };
         const result: JsonResult = handleRest(ctx);
-        sendJson(result);
+        sendJson(response, requestId, result);
         return;
       }
 
@@ -220,7 +276,7 @@ export function createApp(options: AppOptions): { server: Server; store: Store }
       if (method === 'POST' && segments[0] === 'api' && segments[1] === 'graphql' && segments.length === 2) {
         const body = parseJsonBody(await readRequestBody(request));
         const result = handleGraphQL(store, body);
-        sendJson(result);
+        sendJson(response, requestId, result);
         return;
       }
 
@@ -228,7 +284,7 @@ export function createApp(options: AppOptions): { server: Server; store: Store }
       if (method === 'POST' && segments[0] === 'mcp' && segments.length === 1) {
         const body = await readRequestBody(request);
         const result = handleMcp(store, body);
-        sendJson(result);
+        sendJson(response, requestId, result);
         return;
       }
 
@@ -246,31 +302,31 @@ export function createApp(options: AppOptions): { server: Server; store: Store }
         const service = segments.length === 4 ? 'info/refs' : (segments[2] as string);
         if (service === 'info/refs' && method === 'GET') {
           const result = handleInfoRefs(store, owner, repoName, query.get('service'), request.headers['git-protocol']);
-          sendBinary(result);
+          sendBinary(response, requestId, result);
           return;
         }
         if (service === 'git-upload-pack' && method === 'POST') {
           const body = await readRequestBody(request);
           const result = handleUploadPack(store, owner, repoName, body, request.headers['git-protocol']);
-          sendBinary(result);
+          sendBinary(response, requestId, result);
           return;
         }
         if (service === 'git-receive-pack' && method === 'POST') {
           const body = await readRequestBody(request);
           const result = handleReceivePack(store, owner, repoName, body);
-          sendBinary(result);
+          sendBinary(response, requestId, result);
           return;
         }
       }
 
-      sendJson({ status: 404, json: { message: 'Not Found' } });
+      sendJson(response, requestId, { status: 404, json: { message: 'Not Found' } });
     } catch (err) {
       if (err instanceof HttpError) {
-        sendJson({ status: err.status, json: { message: err.message } });
+        sendJson(response, requestId, { status: err.status, json: { message: err.message } });
         return;
       }
       process.stderr.write(`forge: internal error: ${(err as Error).stack ?? (err as Error).message}\n`);
-      if (!response.headersSent) sendJson({ status: 500, json: { message: 'Internal Server Error' } });
+      if (!response.headersSent) sendJson(response, requestId, { status: 500, json: { message: 'Internal Server Error' } });
       else response.end();
     }
   }

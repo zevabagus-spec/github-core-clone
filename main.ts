@@ -13,6 +13,8 @@
 import { createApp } from './app.ts';
 
 const REQUEST_TIMEOUT_MS = 30_000;
+const BACKOFF_START_MS = 250;
+const BACKOFF_MAX_MS = 2000;
 
 function sleep(ms: number): Promise<void> {
   return new Promise((resolvePromise) => setTimeout(resolvePromise, ms));
@@ -39,7 +41,7 @@ async function fetchJson(url: string, init?: RequestInit): Promise<{ status: num
 }
 
 async function register(envUrl: string, port: number): Promise<void> {
-  let delay = 250;
+  let delay = BACKOFF_START_MS;
   for (;;) {
     try {
       const { status } = await fetchJson(`${envUrl}/register`, {
@@ -57,12 +59,12 @@ async function register(envUrl: string, port: number): Promise<void> {
       // Anything else (network, timeout, 5xx): retry with backoff.
     }
     await sleep(delay);
-    delay = Math.min(2000, delay * 2);
+    delay = Math.min(BACKOFF_MAX_MS, delay * 2);
   }
 }
 
 async function waitForDone(envUrl: string): Promise<void> {
-  let delay = 250;
+  let delay = BACKOFF_START_MS;
   for (;;) {
     try {
       const { status, json } = await fetchJson(`${envUrl}/done`);
@@ -74,7 +76,7 @@ async function waitForDone(envUrl: string): Promise<void> {
       // Poll failures are retried; the harness answers at once when done.
     }
     await sleep(delay);
-    delay = Math.min(2000, delay * 2);
+    delay = Math.min(BACKOFF_MAX_MS, delay * 2);
   }
 }
 

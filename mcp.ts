@@ -133,6 +133,9 @@ export const TOOLS: readonly ToolDefinition[] = [
   },
 ];
 
+/** Tool lookup by name; TOOLS itself stays the advertised list. */
+const TOOLS_BY_NAME = new Map(TOOLS.map((tool) => [tool.name, tool]));
+
 type JsonRpcId = string | number | null;
 
 interface JsonRpcRequest {
@@ -225,7 +228,7 @@ function toolError(message: string): Record<string, unknown> {
 }
 
 function executeTool(store: Store, name: string, args: Record<string, unknown>): Record<string, unknown> {
-  const definition = TOOLS.find((tool) => tool.name === name);
+  const definition = TOOLS_BY_NAME.get(name);
   if (definition === undefined) throw new ToolFailure(`unknown tool ${JSON.stringify(name)}`);
   for (const required of definition.inputSchema.required) {
     if (name === 'merge_pull_request' && required === 'pull_number') {
@@ -366,7 +369,7 @@ export function handleMcp(store: Store, body: Buffer): JsonResult {
   if (method === 'tools/call') {
     const params = (request.params ?? {}) as Record<string, unknown>;
     const toolName = typeof params.name === 'string' ? params.name : '';
-    if (TOOLS.every((tool) => tool.name !== toolName)) {
+    if (!TOOLS_BY_NAME.has(toolName)) {
       return { status: 200, json: rpcError(id, -32602, `unknown tool ${JSON.stringify(toolName)}`) };
     }
     try {

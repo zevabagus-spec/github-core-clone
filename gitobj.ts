@@ -4,6 +4,10 @@
 // Objects: SHA-1 over "<type> <size>\0" + bytes. Trees sort git-style
 // (directories compare as name + '/'). Commits and tags are parsed
 // leniently: headers up to the first blank line, the rest is the message.
+//
+// The hot paths (advertisements, ls-refs, fetch headers, receive-pack
+// reports) are all-ASCII pkt-line sequences, so they are encoded with
+// encodePktText: one string, one Buffer, no per-line allocation.
 
 import { createHash } from 'node:crypto';
 import { deflateSync, inflateSync } from 'node:zlib';
@@ -59,14 +63,15 @@ export function parseTree(data: Uint8Array): TreeEntry[] {
   return entries;
 }
 
-function treeSortKey(entry: { mode: string; name: string }): Buffer {
-  return Buffer.from(entry.mode === '40000' ? `${entry.name}/` : entry.name, 'utf8');
-}
-
 export function buildTree(entries: readonly TreeEntry[]): Buffer {
-  const sorted = [...entries].sort((a, b) => Buffer.compare(treeSortKey(a), treeSortKey(b)));
+  // Sort keys are computed once per entry, not once per comparison.
+  const keyed = entries.map((entry) => ({
+    entry,
+    key: Buffer.from(entry.mode === '40000' ? `${entry.name}/` : entry.name, 'utf8'),
+  }));
+  keyed.sort((a, b) => Buffer.compare(a.key, b.key));
   const parts: Buffer[] = [];
-  for (const entry of sorted) {
+  for (const { entry } of keyed) {
     parts.push(Buffer.from(`${entry.mode} ${entry.name}\0`, 'utf8'));
     parts.push(Buffer.from(entry.oid, 'hex'));
   }
@@ -167,19 +172,49 @@ export function encodePktLines(items: readonly PktItem[]): Buffer {
   return Buffer.concat(parts);
 }
 
+/**
+ * Encode a pkt-line sequence whose payloads are all strings, in one
+ * string build and one Buffer allocation. Lengths are byte lengths, so
+ * non-ASCII payloads frame correctly too. The sequences this serves
+ * (advertisements, ls-refs, fetch section headers, receive-pack reports)
+ * are short, so the joined string stays small.
+ */
+export function encodePktText(items: readonly (string | 'flush' | 'delim')[]): Buffer {
+  let out = '';
+  for (const item of items) {
+    if (item === 'flush') {
+      out += '0000';
+    } else if (item === 'delim') {
+      out += '0001';
+    } else {
+      out += (Buffer.byteLength(item, 'utf8') + 4).toString(16).padStart(4, '0');
+      out += item;
+    }
+  }
+  return Buffer.from(out, 'utf8');
+}
+
 export type DecodedPacket =
   | { kind: 'flush' }
   | { kind: 'delim' }
   | { kind: 'response-end' }
   | { kind: 'data'; payload: Buffer };
 
-const HEX4 = /^[0-9a-fA-F]{4}$/;
+/** Hex digit value, or -1 for a non-hex byte. */
+function hexValue(byte: number): number {
+  if (byte >= 48 && byte <= 57) return byte - 48;
+  if (byte >= 97 && byte <= 102) return byte - 87;
+  if (byte >= 65 && byte <= 70) return byte - 55;
+  return -1;
+}
 
 /**
  * Decode pkt-lines from `buffer` starting at `start` until `stopAtFlush`
  * consumes a flush packet (receive-pack commands) or the buffer ends.
  * Returns the packets and the offset just past what was consumed, so a
- * caller can treat the remainder as raw bytes (a packfile).
+ * caller can treat the remainder as raw bytes (a packfile). Length headers
+ * are parsed arithmetically, with no per-packet string or regex work; the
+ * diagnostic string is built only on the error path.
  */
 export function decodePktLines(
   buffer: Buffer,
@@ -190,9 +225,15 @@ export function decodePktLines(
   let offset = start;
   while (offset < buffer.length) {
     if (offset + 4 > buffer.length) throw new Error('truncated pkt-line header');
-    const head = buffer.subarray(offset, offset + 4).toString('ascii');
-    if (!HEX4.test(head)) throw new Error(`invalid pkt-line length ${JSON.stringify(head)}`);
-    const length = Number.parseInt(head, 16);
+    const d0 = hexValue(buffer[offset] as number);
+    const d1 = hexValue(buffer[offset + 1] as number);
+    const d2 = hexValue(buffer[offset + 2] as number);
+    const d3 = hexValue(buffer[offset + 3] as number);
+    if (d0 < 0 || d1 < 0 || d2 < 0 || d3 < 0) {
+      const head = buffer.subarray(offset, offset + 4).toString('ascii');
+      throw new Error(`invalid pkt-line length ${JSON.stringify(head)}`);
+    }
+    const length = d0 * 4096 + d1 * 256 + d2 * 16 + d3;
     if (length === 0) {
       packets.push({ kind: 'flush' });
       offset += 4;
@@ -362,9 +403,9 @@ export function readPack(pack: Buffer, resolveBase?: (oid: string) => GitObject 
   if (version !== 2 && version !== 3) throw new Error(`unsupported pack version ${version}`);
   const declaredCount = pack.readUInt32BE(8);
   const trailerStart = pack.length - 20;
-  const trailer = pack.subarray(trailerStart).toString('hex');
-  const computed = createHash('sha1').update(pack.subarray(0, trailerStart)).digest('hex');
-  if (trailer !== computed) throw new Error('pack trailer checksum mismatch');
+  const trailer = pack.subarray(trailerStart);
+  const computed = createHash('sha1').update(pack.subarray(0, trailerStart)).digest();
+  if (!trailer.equals(computed)) throw new Error('pack trailer checksum mismatch');
 
   const raw: RawPackEntry[] = [];
   const byOffset = new Map<number, RawPackEntry>();
